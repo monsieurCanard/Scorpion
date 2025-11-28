@@ -1,6 +1,3 @@
-from unittest import case
-
-
 class GifImage:
     def __init__(self, image_delay: int, transparent_color_index: int):
         self.image_delay = image_delay
@@ -11,6 +8,7 @@ class AppExtension:
     def __init__(self, app_identifier: bytes, app_data: bytes):
         self.app_identifier = app_identifier
         self.app_data: bytearray = app_data
+        self.loop_count: int = 0
 
 
 class CommentExtension:
@@ -18,25 +16,11 @@ class CommentExtension:
         self.comment_data = comment_data
 
 
-class GifExtractor:
+class GifReader:
     def __init__(self, data: bytes, filename: str):
         self.data: bytes = data
         self.offset: int = 0
-        self.filename = filename
-
-        self.signature = ""
-        self.version = ""
-        self.width = 0
-        self.height = 0
-        self.global_color_table_flag = 0
-        self.color_resolution = 0
-        self.sort_flag = 0
-        self.size_of_gct = 0
-        self.background_color_index = 0
-        self.images: list[GifImage] = []
-        self.app_extensions: list[AppExtension] = []
-        self.comment_extensions: list[CommentExtension] = []
-        self.plain_text_extensions: list[str] = []
+        self.infos = dict()
 
     def extract(self):
         while self.data[self.offset] != 0x3B:  # 0x3B is the GIF file terminator
@@ -44,7 +28,7 @@ class GifExtractor:
             match byte:
                 case 0x2C:  # Image Descriptor
                     self.skip_image()
-                    break
+                    continue
                 case 0x21:  # Extension Introducer
                     self.handle_extension()
                 case _:
@@ -59,7 +43,7 @@ class GifExtractor:
             self.offset += 1
             comment_data = self.data[self.offset : self.offset + block_size]
             comment_text = comment_data.decode("ascii", errors="ignore")
-            self.comment_extensions.append(CommentExtension(comment_text))
+            self.infos.setdefault("Comment Extensions", []).append(comment_text)
             self.offset += block_size  # Move to the next sub-block
 
         self.offset += 1  # Skip the block terminator
@@ -73,7 +57,9 @@ class GifExtractor:
                 delay = self.data[self.offset + 1] + (self.data[self.offset + 2] << 8)
                 transparent_index = self.data[self.offset + 3]
                 self.offset += 5
-                self.images.append(GifImage(delay, transparent_index))
+                self.infos.setdefault("Images", []).append(
+                    {"delay": delay, "transparent_index": transparent_index}
+                )
                 return
             case 0xFE:
                 self.read_comment_extension()
@@ -85,16 +71,19 @@ class GifExtractor:
                 ]  # La taille du bloc est variable ici
                 self.offset += 1
                 app_identifier = self.data[self.offset : self.offset + block_size]
+                application = app_identifier.decode("ascii", errors="ignore")
                 self.offset += block_size
 
-                app_info = AppExtension(app_identifier, bytearray())
+                app_data = bytearray()
                 while self.data[self.offset] != 0:
                     size = self.data[self.offset]
                     self.offset += 1
-                    app_info.app_data += self.data[self.offset : self.offset + size]
+                    app_data += self.data[self.offset : self.offset + size]
                     self.offset += size
                 self.offset += 1
-                self.app_extensions.append(app_info)
+                self.infos.setdefault("App Extensions", []).append(
+                    {"application": application, "data length": len(app_data)}
+                )
                 return
             case 0x01:  # Plain Text Extension (GIF89a)
                 self.offset += 2
@@ -109,46 +98,16 @@ class GifExtractor:
                     ].decode("ascii", errors="ignore")
                     self.offset += sub_block_size
 
-                self.plain_text_extensions.append(text_data)
+                self.infos.setdefault("Plain Text Extensions", []).append(text_data)
                 self.offset += 1
                 return
             case _:
                 self.offset += 2
-
                 while self.data[self.offset] != 0:
                     block_size = self.data[self.offset]
                     self.offset += 1 + block_size
                 self.offset += 1
                 return self.offset
-
-    def _identify_extension_type(self, data: bytes) -> str:
-        """Identifie le type d'extension inconnue"""
-
-        # Détection EXIF (plusieurs patterns possibles)
-        if (
-            data.startswith(b"Exif")
-            or data.startswith(b"\xff\xd8\xff")  # JPEG marker
-            or data.startswith(b"\x49\x49\x2a\x00")  # TIFF little-endian
-            or data.startswith(b"\x4d\x4d\x00\x2a")  # TIFF big-endian
-            or b"Exif\x00\x00" in data[:20]
-        ):
-            return "exif"
-
-        # Détection XMP
-        elif data.startswith(b"<?xpacket") or b"<x:xmpmeta" in data[:50]:
-            return "xmp"
-
-        # Détection ICC Profile
-        elif b"ICC_PROFILE" in data[:50]:
-            return "icc"
-
-        # Texte ASCII simple
-        elif data[:50].isascii() and len(data) > 3:
-            text = data.decode("ascii")
-            if text.isprintable():
-                return "text"
-
-        return "unknown"
 
     def skip_image(self):
         if self.offset + 9 >= len(self.data):
@@ -179,6 +138,7 @@ class GifExtractor:
                 self.offset += 1
                 break
             self.offset += block_size + 1  # Move to the next sub-block
+
         self.offset += 1  # Skip the block terminator
 
     def extract_header(self):
@@ -186,9 +146,8 @@ class GifExtractor:
         header = self.data[:6]
         version = header[3:].decode("ascii")
         signature = header[:3].decode("ascii")
-
-        self.signature = signature
-        self.version = version
+        self.infos["Signature"] = signature
+        self.infos["Version"] = version
 
         # ! Lsd bytes -> Logical Screen Descriptor
         # 6-7 : Width (2 bytes)
@@ -197,83 +156,90 @@ class GifExtractor:
         # 11   : Background Color Index (1 byte)
         # 12   : Pixel Aspect Ratio (1 byte)
         lsd = self.data[6:13]
-        self.width = int.from_bytes(lsd[0:2], "little")
-        self.height = int.from_bytes(lsd[2:4], "little")
-        self.global_color_table_flag = (lsd[4] & 0b10000000) >> 7
-        self.color_resolution = ((lsd[4] & 0b01110000) >> 4) + 1
+        self.infos["Width"] = int.from_bytes(lsd[0:2], "little")
+        self.infos["Height"] = int.from_bytes(lsd[2:4], "little")
+        self.infos["Global Color Table Flag"] = (lsd[4] & 0b10000000) >> 7
+        self.infos["Color Resolution"] = ((lsd[4] & 0b01110000) >> 4) + 1
 
         # Sort Flag : 1 bit (1 = global color table is sorted)
         # Sort Flag : 1 bit (0 = global color table is not sorted)
-        self.sort_flag = (lsd[4] & 0b00001000) >> 3
-
-        self.size_of_gct = 2 ** ((lsd[4] & 0b00000111) + 1)
-        self.background_color_index = lsd[5]
+        self.infos["Sort Flag"] = (lsd[4] & 0b00001000) >> 3
+        self.infos["Size of Global Color Table"] = 2 ** ((lsd[4] & 0b00000111) + 1)
+        self.infos["Background Color Index"] = lsd[5]
 
         self.pixel_aspect_ratio = lsd[6]
         if self.pixel_aspect_ratio != 0:
-            self.aspect_ratio = (self.pixel_aspect_ratio + 15) / 64
+            self.infos["Aspect Ratio"] = (self.pixel_aspect_ratio + 15) / 64
         else:
-            self.aspect_ratio = None
+            self.infos["Aspect Ratio"] = None
 
         # Background Color Index : 1 byte (index in the global color table)
         # Couleur de fond de l'image
-        background_color_index = lsd[5]
-        print(f"Background Color Index: {background_color_index}")
-
-        start_index = 13
-        if self.global_color_table_flag:
-            # ! Global Color Table
-            size = 3 * self.size_of_gct
-            gct = self.data[start_index : start_index + size]
-            # print(f"Number of differents colors {size // 3}")
-            # print("First 3 colors in Global Color Table:")
-            # for i in range(size // 3):
-            #     r = gct[i * 3]
-            #     g = gct[i * 3 + 1]
-            #     b = gct[i * 3 + 2]
-            # print(f"  Color {i}: R={r} G={g} B={b}")
+        self.infos["Background Color Index"] = lsd[5]
         return
 
-    def print_all_infos(self):
-        print("================================")
-        print(f"GIF Extractor Metadata from file: {self.filename}")
-        print("================================")
-        print("Header Information:")
-        print("--------------------------------")
-        print(f"Signature: {self.signature}")
-        print(f"Version: {self.version}")
-        print(f"Width: {self.width} pixels")
-        print(f"Height: {self.height} pixels")
-        print(f"Global Color Table Flag: {self.global_color_table_flag}")
-        print(f"Color Resolution: {self.color_resolution} bits per primary color")
-        print(f"Sort Flag: {self.sort_flag}")
-        print(f"Size of Global Color Table: {self.size_of_gct} colors")
-        # print(f"Background Color Index: {self.background_color_index}")
-        print("================================")
-        print("Images informations:")
-        print("================================")
-        for i, image in enumerate(self.images):
-            print(
-                f"Image {i + 1}: Delay={image.image_delay} cs, Transparent Color Index={image.transparent_color_index}"
-            )
-
-        print("================================")
-        print("Application Extensions:")
-        print("================================")
-
-        for i, app_ext in enumerate(self.app_extensions):
-            print(
-                f"Application Extension {i + 1}: Identifier={app_ext.app_identifier}, Data Length={len(app_ext.app_data)} bytes"
-                f" App Data={app_ext.app_data.decode('ascii', errors='ignore')}"
-            )
-
-        print("================================")
-        print("Comment Extensions:")
-        print("================================")
-        for i, comment_ext in enumerate(self.comment_extensions):
-            print(f"Comment Extension {i + 1}: Comment Data={comment_ext.comment_data}")
-
     def run(self):
+        """
+        Extracteur de métadonnées pour fichiers GIF87a et GIF89a.
+
+        Attributes
+        ----------
+        data : bytes
+            Contenu brut du fichier GIF.
+        offset : int
+            Position actuelle dans le parsing du fichier.
+        filename : str
+            Nom du fichier GIF analysé.
+        signature : str
+            Signature du fichier GIF (doit être "GIF").
+        version : str
+            Version du format GIF ("87a" ou "89a").
+        width : int
+            Largeur de l'image en pixels.
+        height : int
+            Hauteur de l'image en pixels.
+        global_color_table_flag : int
+            Indique la présence d'une table de couleurs globale (1 = présente, 0 = absente).
+        color_resolution : int
+            Résolution des couleurs (nombre de bits par couleur primaire).
+        sort_flag : int
+            Indique si la table de couleurs globale est triée (1 = triée, 0 = non triée).
+        size_of_gct : int
+            Taille de la table de couleurs globale (nombre d'entrées).
+        background_color_index : int
+            Index de la couleur de fond dans la table de couleurs globale.
+        images : list of GifImage
+            Liste des images extraites du GIF.
+
+            Chaque GifImage contient :
+
+            - image_delay : int
+                Délai d'affichage en centièmes de seconde (0.01s par unité).
+            - transparent_color_index : int
+                Index de la couleur transparente dans la palette (0-255).
+
+        app_extensions : list of AppExtension
+            Application Extensions détectées dans le fichier.
+
+            Chaque AppExtension contient :
+
+            - app_identifier : bytes
+                Identifiant de l'application sur 11 bytes.
+                Format : 8 bytes nom + 3 bytes version.
+                Exemple : b'NETSCAPE2.0'
+            - app_data : bytearray
+                Données binaires spécifiques à l'application.
+            - loop_count : int, optional
+                Nombre de boucles d'animation (0 = infini).
+                Présent uniquement pour NETSCAPE2.0 et ANIMEXTS1.0.
+
+        comment_extensions : list of CommentExtension
+            Commentaires texte extraits du GIF.
+
+            Chaque CommentExtension contient :
+
+            comment_data : str
+                Texte du commentaire en ASCII.
+        """
         self.extract_header()
         self.extract()
-        self.print_all_infos()
