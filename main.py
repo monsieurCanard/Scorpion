@@ -1,10 +1,10 @@
 import argparse
 import os
-from GifReader import GifReader
-from BmpReader import BmpReader, BmpInfos
-from PngReader import PngReader
-from JpgReader import JPGParser
-from printer import print_metadata
+from metadata_readers.GifReader import GifReader
+from metadata_readers.BmpReader import BmpReader, BmpInfos
+from metadata_readers.PngReader import PngReader
+from metadata_readers.JpgReader import JPGParser
+from utils.printer import print_metadata
 
 
 def init_arg_parse():

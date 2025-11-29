@@ -2,7 +2,7 @@ from PIL import Image
 from io import BytesIO
 import argparse
 
-from JpgReader import JPGParser
+from metadata_readers.JpgReader import JPGParser
 
 
 class PngReader:
